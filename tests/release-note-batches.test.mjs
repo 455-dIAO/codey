@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chunkPatches, mergeNoteResults } from "../scripts/release-note-batches.mjs";
+import { chunkNotePatches, chunkPatches, createNoteBatchInput, mergeNoteResults, resolveNoteEntries } from "../scripts/release-note-batches.mjs";
+import { validateNotes } from "../scripts/release-automation.mjs";
 
 function byteLength(value) {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
@@ -76,4 +77,49 @@ test("deduplicates exact note text while preserving its evidence", () => {
 test("ignores empty batch results", () => {
   assert.deepEqual(mergeNoteResults([{ notes: "", evidence: [] }]), { notes: "", evidence: [] });
   for (const result of [null, { notes: "", evidence: [{}] }, { notes: "- 无证据结论", evidence: [] }]) assert.throws(() => mergeNoteResults([result]));
+});
+
+test("reference entries restore exact original evidence without AI copying paths or code", () => {
+  const patches = [{ file: "src/文件.js", diff: 'diff --git a/src/文件.js b/src/文件.js\r\n--- a/src/文件.js\r\n+++ b/src/文件.js\r\n@@ -1 +1,2 @@\r\n context +not-a-change\r\n+const label = "转义\\\\路径";\r\n+}\r\n' }];
+  const input = createNoteBatchInput(patches, 1);
+  assert.equal(input.references.size, 2);
+  assert.equal(input.patches[0].diff.replace(/^\[evidence:b\d+p\d+l\d+\] /gm, ""), patches[0].diff);
+  const entries = [...input.references.keys()].map((ref, index) => ({ ref, note: `变更 ${index + 1}`, file: "fabricated.js", excerpt: "+fabricated evidence" }));
+  const result = resolveNoteEntries({ entries }, input.references);
+  assert.equal(validateNotes(result, patches).notes_status, "generated");
+  for (const evidence of result.evidence) {
+    assert.equal(evidence.file, patches[0].file);
+    assert.ok(patches[0].diff.includes(evidence.excerpt));
+    assert.doesNotMatch(evidence.excerpt, /fabricated/);
+  }
+  assert.deepEqual(resolveNoteEntries({ entries: [] }, input.references), { notes: "", evidence: [] });
+});
+
+test("unknown references, context lines, headers and references from another batch are rejected", () => {
+  const patches = [{ file: "same.js", diff: "--- a/same.js\n+++ b/same.js\n context +not-a-change\n+const real = true;\n" }];
+  const first = createNoteBatchInput(patches, 0);
+  const second = createNoteBatchInput(patches, 1);
+  assert.equal(first.references.size, 1);
+  for (const ref of ["fabricated", [...second.references.keys()][0], "b0000000001p0l0", "b0000000001p0l2"]) {
+    assert.throws(() => resolveNoteEntries({ entries: [{ note: "拒绝伪造证据", ref }] }, first.references), /第 1 条.*不属于当前批次/);
+  }
+  assert.throws(() => resolveNoteEntries({ entries: [{ note: "多行\n注入", ref: [...first.references.keys()][0] }] }, first.references), /文字无效/);
+});
+
+test("annotation overhead is included in the batch byte budget and all raw differences remain intact", () => {
+  const patches = [{ file: "large.js", diff: Array.from({ length: 100 }, (_, index) => `+const 中文_${index} = "\\\\路径";\r\n`).join("") }];
+  const batches = chunkNotePatches(patches, 512);
+  assert.ok(batches.length > 1);
+  const refs = new Set();
+  for (const [index, batch] of batches.entries()) {
+    const input = createNoteBatchInput(batch, index);
+    assert.ok(byteLength(input.patches) <= 512);
+    for (const ref of input.references.keys()) {
+      assert.ok(!refs.has(ref));
+      refs.add(ref);
+    }
+  }
+  assert.equal(refs.size, 100);
+  assertReassembled(patches, batches);
+  assert.throws(() => chunkNotePatches([{ file: "long.js", diff: `+${"a".repeat(100)}\n` }], 128), /单批大小限制/);
 });

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { analyzeNotePatches, assertSameAssets, callback, collectNotePatches, generateNotes, identity, main, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
+import { analyzeNoteBatch, analyzeNotePatches, assertSameAssets, callback, collectNotePatches, generateNotes, identity, main, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
 
 const environment = {
   RELEASE_BUILD_ID: "build_test-123", RELEASE_ATTEMPT: "2", GITHUB_RUN_ID: "456", RELEASE_ACTION: "build",
@@ -135,6 +135,59 @@ test("empty batch summaries are allowed but an entirely empty release requires m
   const result = await analyzeNotePatches(largeNotePatches(), build, async batch => ++calls === 1 ? batchNote(batch, "确认代码变更") : { notes: "", evidence: [] });
   assert.equal(result.evidence.length, 1);
   await assert.rejects(analyzeNotePatches([{ file: "internal.js", diff: "+const internal = true;\n" }], build, async () => ({ notes: "", evidence: [] })), /缺少有效日志/);
+});
+
+test("Copilot returns only notes and references while the script preserves exact CRLF and escaped evidence", async () => {
+  const patches = [{ file: "src/路径.js", diff: '+const label = "escaped\\\\path";\r\n' }];
+  let calls = 0;
+  const result = await analyzeNoteBatch(patches, build, 0, 1, async (command, args, options) => {
+    calls += 1;
+    assert.equal(command, "copilot");
+    for (const flag of ["--available-tools", "--deny-tool", "--disable-builtin-mcps", "--no-custom-instructions", "--no-auto-update", "--no-ask-user"]) assert.ok(args.includes(flag));
+    assert.equal(options.timeout, 300_000);
+    const ref = args[1].match(/\[evidence:(b\d+p\d+l\d+)\]/)[1];
+    return { stdout: JSON.stringify({ entries: [{ note: "调整路径处理", ref }] }) };
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.notes, "- 调整路径处理");
+  assert.equal(result.evidence[0].file, patches[0].file);
+  assert.equal(result.evidence[0].excerpt, patches[0].diff.slice(0, -1));
+});
+
+test("invalid AI references receive one correction with sanitized diagnostics", async () => {
+  const patches = [{ file: "retry.js", diff: "+const retries = 3;\n" }];
+  let calls = 0;
+  const result = await analyzeNoteBatch(patches, build, 0, 1, async (command, args) => {
+    calls += 1;
+    if (calls === 1) return { stdout: JSON.stringify({ entries: [{ note: "调整重试", ref: "sensitive-invented-reference" }] }) };
+    assert.match(args[1], /上次输出未通过校验.*第 1 条.*不属于当前批次/);
+    assert.doesNotMatch(args[1], /sensitive-invented-reference/);
+    return { stdout: JSON.stringify({ entries: [{ note: "调整重试", ref: args[1].match(/\[evidence:(b\d+p\d+l\d+)\]/)[1] }] }) };
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.notes_status, "generated");
+});
+
+test("invalid JSON never appears in the correction prompt and repeated invalid references still fail", async () => {
+  const patches = [{ file: "retry.js", diff: "+const retries = 3;\n" }];
+  let calls = 0;
+  await assert.rejects(analyzeNoteBatch(patches, build, 0, 1, async (command, args) => {
+    calls += 1;
+    if (calls === 1) return { stdout: "private-output-should-not-be-logged {" };
+    assert.match(args[1], /不是有效 JSON/);
+    assert.doesNotMatch(args[1], /private-output-should-not-be-logged/);
+    return { stdout: JSON.stringify({ entries: [{ note: "错误引用", ref: "missing" }] }) };
+  }), /第 1 条.*不属于当前批次/);
+  assert.equal(calls, 2);
+});
+
+test("Copilot command failures are not replayed as output corrections", async () => {
+  let calls = 0;
+  await assert.rejects(analyzeNoteBatch([{ file: "retry.js", diff: "+const retries = 3;\n" }], build, 0, 1, async () => {
+    calls += 1;
+    throw Object.assign(new Error("network failure"), { cmd: "copilot --prompt" });
+  }), /network failure/);
+  assert.equal(calls, 1);
 });
 
 for (const [lineEndingName, lineEnding] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
@@ -372,6 +425,24 @@ test("a failed batch discards every partial note and masks command prompts", asy
     assert.deepEqual(result.evidence, []);
     assert.match(result.reason, /第 2\/.*AI 调用失败/);
     assert.doesNotMatch(result.reason, /sensitive|credentials|prompt with/);
+  });
+});
+
+test("reference correction exhaustion still discards previously successful batch notes", async () => {
+  await sandboxBuild("notes", async () => {
+    let calls = 0;
+    await generateNotes({ collect: async () => largeNotePatches(), analyze: (batch, context, index, total) => analyzeNoteBatch(batch, context, index, total, async (command, args) => {
+      calls += 1;
+      const ref = index === 0 ? args[1].match(/\[evidence:(b\d+p\d+l\d+)\]/)[1] : "invented-reference";
+      return { stdout: JSON.stringify({ entries: [{ note: "不应保留的部分日志", ref }] }) };
+    }) });
+    const result = JSON.parse(await readFile("release-notes.json", "utf8"));
+    assert.equal(calls, 3);
+    assert.equal(result.notes_status, "manual_required");
+    assert.equal(result.notes, "");
+    assert.deepEqual(result.evidence, []);
+    assert.match(result.reason, /第 2\/.*第 1 条.*不属于当前批次/);
+    assert.doesNotMatch(result.reason, /invented-reference/);
   });
 });
 

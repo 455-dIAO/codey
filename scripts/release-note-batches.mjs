@@ -24,9 +24,10 @@ function validateMaxBytes(maxBytes) {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new Error("单批大小必须是正整数");
 }
 
-export function chunkPatches(patches, maxBytes = DEFAULT_MAX_BYTES) {
+export function chunkPatches(patches, maxBytes = DEFAULT_MAX_BYTES, measure = serializedBytes) {
   validateMaxBytes(maxBytes);
   if (!Array.isArray(patches)) throw new TypeError("差异补丁必须是数组");
+  if (typeof measure !== "function") throw new TypeError("差异大小计算方式无效");
 
   const chunks = [];
   for (const patch of patches) {
@@ -35,11 +36,11 @@ export function chunkPatches(patches, maxBytes = DEFAULT_MAX_BYTES) {
     for (const line of splitDiffLines(patch.diff)) {
       const candidate = fragment + line;
       const entry = { file: patch.file, diff: candidate };
-      if (serializedBytes([entry]) > maxBytes) {
+      if (measure([entry]) > maxBytes) {
         if (!fragment) throw new Error(`单行差异与文件路径序列化后超过单批大小限制：${patch.file}`);
         chunks.push({ file: patch.file, diff: fragment });
         fragment = line;
-        if (serializedBytes([{ file: patch.file, diff: fragment }]) > maxBytes) throw new Error(`单行差异与文件路径序列化后超过单批大小限制：${patch.file}`);
+        if (measure([{ file: patch.file, diff: fragment }]) > maxBytes) throw new Error(`单行差异与文件路径序列化后超过单批大小限制：${patch.file}`);
       } else {
         fragment = candidate;
       }
@@ -51,7 +52,7 @@ export function chunkPatches(patches, maxBytes = DEFAULT_MAX_BYTES) {
   let batch = [];
   for (const chunk of chunks) {
     const candidate = [...batch, chunk];
-    if (serializedBytes(candidate) > maxBytes) {
+    if (measure(candidate) > maxBytes) {
       if (batch.length) batches.push(batch);
       batch = [chunk];
     } else {
@@ -60,6 +61,50 @@ export function chunkPatches(patches, maxBytes = DEFAULT_MAX_BYTES) {
   }
   if (batch.length) batches.push(batch);
   return batches;
+}
+
+function excerptForLine(lines, index) {
+  let start = index;
+  let end = index + 1;
+  let excerpt = lines[index].replace(/\n$/, "");
+  while (excerpt.length < 8 && (start > 0 || end < lines.length)) {
+    if (start > 0) start -= 1;
+    else end += 1;
+    excerpt = lines.slice(start, end).join("");
+  }
+  return excerpt.length >= 8 ? excerpt : null;
+}
+
+export function createNoteBatchInput(patches, batchIndex = 0) {
+  const references = new Map();
+  const annotated = patches.map((patch, patchIndex) => {
+    const lines = splitDiffLines(patch.diff);
+    const diff = lines.map((line, lineIndex) => {
+      if (!/^[+-](?![+-]{2}).+/.test(line)) return line;
+      const excerpt = excerptForLine(lines, lineIndex);
+      if (!excerpt) return line;
+      const ref = `b${String(batchIndex + 1).padStart(10, "0")}p${patchIndex}l${lineIndex}`;
+      references.set(ref, { file: patch.file, excerpt });
+      return `[evidence:${ref}] ${line}`;
+    }).join("");
+    return { file: patch.file, diff };
+  });
+  return { patches: annotated, references };
+}
+
+export function chunkNotePatches(patches, maxBytes = DEFAULT_MAX_BYTES) {
+  return chunkPatches(patches, maxBytes, batch => serializedBytes(createNoteBatchInput(batch).patches));
+}
+
+export function resolveNoteEntries(value, references) {
+  if (!value || !Array.isArray(value.entries)) throw new Error("AI 输出必须包含 entries 数组");
+  const evidence = value.entries.map((entry, index) => {
+    if (!entry || typeof entry.note !== "string" || !entry.note.trim() || /[\r\n]/.test(entry.note)) throw new Error(`第 ${index + 1} 条日志文字无效`);
+    const reference = typeof entry.ref === "string" ? references.get(entry.ref) : null;
+    if (!reference) throw new Error(`第 ${index + 1} 条日志引用的变更编号不属于当前批次`);
+    return { note: entry.note.trim(), ...reference };
+  });
+  return { notes: evidence.map(item => `- ${item.note}`).join("\n"), evidence };
 }
 
 export function mergeNoteResults(results) {
