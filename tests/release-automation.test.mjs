@@ -130,6 +130,30 @@ test("all patches are checked for secrets and binaries before the first AI reque
   }
 });
 
+test("quoted private key header fixtures pass without allowing actual or partial keys", async () => {
+  const marker = ["-----BEGIN", "PRIVATE KEY-----"].join(" ");
+  const fixture = { file: "tests/example.test.mjs", diff: `+{ diff: "+${marker}\\n" },\n` };
+  let calls = 0;
+  await analyzeNotePatches([fixture], build, async batch => {
+    calls += 1;
+    return { notes: "- 增加私钥检测测试", evidence: [{ note: "增加私钥检测测试", file: batch[0].file, excerpt: batch[0].diff.trimEnd() }] };
+  });
+  assert.equal(calls, 1);
+  for (const prefix of ["+", "-", " "]) {
+    for (const content of [
+      `${marker}\n${prefix}${"A".repeat(48)}\n`,
+      `const key = "${marker}\\n${"A".repeat(48)}";\n`,
+      `const token = 'ghp_${"a".repeat(40)}';\n`,
+    ]) {
+      await assert.rejects(analyzeNotePatches([{ file: "src/credentials.js", diff: prefix + content }], build, () => assert.fail("sensitive diffs must not reach AI")), error => {
+        assert.match(error.message, /src\/credentials\.js/);
+        assert.doesNotMatch(error.message, /A{48}|a{40}/);
+        return true;
+      });
+    }
+  }
+});
+
 test("empty batch summaries are allowed but an entirely empty release requires manual notes", async () => {
   let calls = 0;
   const result = await analyzeNotePatches(largeNotePatches(), build, async batch => ++calls === 1 ? batchNote(batch, "确认代码变更") : { notes: "", evidence: [] });

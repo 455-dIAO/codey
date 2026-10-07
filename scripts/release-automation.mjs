@@ -212,8 +212,13 @@ export function preflightNotePatches(patches) {
   if (!patches.length || !patches.some(patch => patch.diff.trim())) throw new Error("差异为空，请人工填写日志");
   if (patches.some(patch => /^Binary files .* differ$|^GIT binary patch$/m.test(patch.diff))) throw new Error("差异包含二进制变更，请人工填写日志");
   if (patches.some(patch => /(?:^|\/)(?:\.env(?:\.(?!example$|sample$)[^/]+)?|[^/]+\.(?:pem|key|p12))$/.test(patch.file))) throw new Error("差异包含可能存储凭据的文件，已停止 AI 分析");
-  const sensitive = /(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\b(?:ghp_|github_pat_|sk-proj-)[A-Za-z0-9_]{16,})/;
-  if (patches.some(patch => sensitive.test(patch.diff))) throw new Error("差异可能包含密钥，已停止 AI 分析");
+  const token = /\b(?:ghp_|github_pat_|sk-proj-)[A-Za-z0-9_]{16,}/;
+  const privateKey = /-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----(?=\s*$|(?:\s|\\[nr])*[A-Za-z0-9+/=]{32})/m;
+  for (const patch of patches) {
+    const content = patch.diff.replace(/^[ +-]/gm, "");
+    const category = token.test(content) ? "访问令牌" : privateKey.test(content) ? "私钥" : null;
+    if (category) throw new Error(`差异可能包含密钥，已停止 AI 分析（${patch.file}：${category}）`);
+  }
 }
 
 export async function analyzeNoteBatch(patches, build, index, total, request = execute) {
