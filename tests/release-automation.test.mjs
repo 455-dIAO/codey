@@ -271,21 +271,72 @@ async function sandboxBuild(action, handler) {
 
 test("updating draft notes preserves the tag, commit and ownership and rejects a changed response", async () => {
   await sandboxBuild("build", async () => {
-    const release = { id: 10, tag_name: build.tag, draft: true, body: `<!-- codey-build:${build.id} -->` };
+    const release = { id: 10, tag_name: build.tag, target_commitish: build.source_sha, draft: true, body: `<!-- codey-build:${build.id} -->` };
     let changed = false;
     globalThis.fetch = async (url, options) => {
       assert.equal(url, "https://api.github.com/repos/owner/codey/releases/10");
       assert.equal(options.method, "PATCH");
       const body = JSON.parse(options.body);
-      assert.equal(body.target_commitish, build.source_sha);
+      assert.deepEqual(Object.keys(body).sort(), ["body", "tag_name"]);
+      assert.ok(!("target_commitish" in body));
       return Response.json({ ...release, ...body, tag_name: changed ? "untagged-test" : body.tag_name || "untagged-test" });
     };
     const updated = await updateReleaseNotes(release, build, "- 修复发布流程");
     assert.equal(updated.tag_name, build.tag);
+    assert.equal(updated.target_commitish, build.source_sha);
     assert.equal(updated.draft, true);
     assert.match(updated.body, /修复发布流程/);
     changed = true;
     await assert.rejects(updateReleaseNotes(release, build, "- 修复发布流程"), /占用/);
+  });
+});
+
+test("GitHub release errors retain status, request ID and the server denial reason", async () => {
+  await sandboxBuild("notes", async () => {
+    const release = { id: 10, tag_name: build.tag, draft: true, body: `<!-- codey-build:${build.id} -->` };
+    let calls = 0;
+    globalThis.fetch = async (url, options) => {
+      calls += 1;
+      assert.equal(options.method, "PATCH");
+      return Response.json({ message: "Resource not accessible by integration", documentation_url: "https://docs.github.com/rest/releases/releases" }, { status: 403, headers: { "x-github-request-id": "E000:16483:3B520E:40969C:6AC5877E" } });
+    };
+    await assert.rejects(updateReleaseNotes(release, build, "- 修复发布流程"), error => {
+      assert.match(error.message, /403.*E000:16483:3B520E:40969C:6AC5877E/);
+      assert.match(error.message, /Resource not accessible by integration/);
+      return true;
+    });
+    assert.equal(calls, 1);
+  });
+});
+
+test("GitHub error diagnostics redact credentials, control characters and non-message fields", async () => {
+  await sandboxBuild("notes", async () => {
+    const release = { id: 10, tag_name: build.tag, draft: true, body: `<!-- codey-build:${build.id} -->` };
+    process.env.GH_TOKEN = "private-test-credential";
+    const token = `ghp_${"a".repeat(40)}`;
+    globalThis.fetch = async () => Response.json({
+      message: `\u001b[31mDenied\u0000\n${process.env.GH_TOKEN} ${token} Bearer arbitrary-private-value ${environment.RELEASE_ADMIN_CALLBACK_SECRET} ${"x".repeat(1000)} message-tail`,
+      request: { body: "private-source-body", authorization: "private-authorization" },
+    }, { status: 403 });
+    await assert.rejects(updateReleaseNotes(release, build, "- 修复发布流程"), error => {
+      assert.match(error.message, /Denied.*\[redacted\]/);
+      assert.doesNotMatch(error.message, /private-test-credential|ghp_|arbitrary-private-value|private-source-body|private-authorization|message-tail|\u0000|\u001b|\n/);
+      assert.ok(!error.message.includes(environment.RELEASE_ADMIN_CALLBACK_SECRET));
+      assert.ok(error.message.length < 600);
+      return true;
+    });
+  });
+});
+
+test("non-JSON GitHub error bodies are not logged and never hide the original HTTP failure", async () => {
+  await sandboxBuild("notes", async () => {
+    const release = { id: 10, tag_name: build.tag, draft: true, body: `<!-- codey-build:${build.id} -->` };
+    globalThis.fetch = async () => new Response("<html>private-upstream-body</html>", { status: 502 });
+    await assert.rejects(updateReleaseNotes(release, build, "- 修复发布流程"), error => {
+      assert.match(error.message, /GitHub PATCH releases\/10 失败（502/);
+      assert.doesNotMatch(error.message, /private-upstream-body|JSON|html/);
+      return true;
+    });
   });
 });
 

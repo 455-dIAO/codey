@@ -69,6 +69,23 @@ async function loadBuild() {
   return validateBuild(JSON.parse(await readFile(buildFile, "utf8")));
 }
 
+async function githubFailureDetail(response) {
+  let message;
+  try { message = (await response.json()).message; }
+  catch { return ""; }
+  if (typeof message !== "string") return "";
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN", "RELEASE_ADMIN_CALLBACK_SECRET", "CLOUDFLARE_API_TOKEN"]) {
+    const secret = process.env[key];
+    if (secret && secret.length >= 8) message = message.replaceAll(secret, "[redacted]");
+  }
+  message = message.replace(/\b(?:gh[pousr]_|github_pat_|cfat_|sk-(?:proj-)?)[A-Za-z0-9_-]{8,}/g, "[redacted]")
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+    .replace(/\s+/g, " ").trim().slice(0, 500);
+  return message ? `：${message}` : "";
+}
+
 async function github(path, method = "GET", body, missing = false) {
   const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}${path ? `/${path}` : ""}`, {
     method, redirect: "error", signal: AbortSignal.timeout(30_000),
@@ -76,7 +93,7 @@ async function github(path, method = "GET", body, missing = false) {
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   if (missing && response.status === 404) return null;
-  if (!response.ok) throw new Error(`GitHub ${method} ${path} 失败（${response.status}，${response.headers.get("x-github-request-id") || "无请求编号"}）`);
+  if (!response.ok) throw new Error(`GitHub ${method} ${path} 失败（${response.status}，${response.headers.get("x-github-request-id") || "无请求编号"}）${await githubFailureDetail(response)}`);
   const text = await response.text();
   return text ? JSON.parse(text) : null;
 }
@@ -113,7 +130,7 @@ async function ownedRelease(build) {
 
 export async function updateReleaseNotes(release, build, notes) {
   validateRelease(release, build);
-  const updated = await github(`releases/${release.id}`, "PATCH", { tag_name: build.tag, target_commitish: build.source_sha, body: `${notes || "更新日志待管理员补充。"}\n\n${marker(build)}` });
+  const updated = await github(`releases/${release.id}`, "PATCH", { tag_name: build.tag, body: `${notes || "更新日志待管理员补充。"}\n\n${marker(build)}` });
   validateRelease(updated, { ...build, release_id: release.id });
   if (updated.draft !== release.draft) throw new Error("GitHub Release 草稿状态意外变更");
   return updated;
