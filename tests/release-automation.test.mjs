@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
-import { analyzeNoteBatch, analyzeNotePatches, assertSameAssets, callback, collectNotePatches, generateNotes, identity, main, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
+import { analyzeNoteBatch, analyzeNotePatches, assertSameAssets, callback, collectNotePatches, generateNotes, identity, main, selectNoteCandidates, signature, updateReleaseNotes, validateBuild, validateNotes, validateRelease } from "../scripts/release-automation.mjs";
 
 const environment = {
   RELEASE_BUILD_ID: "build_test-123", RELEASE_ATTEMPT: "2", GITHUB_RUN_ID: "456", RELEASE_ACTION: "build",
@@ -90,6 +90,17 @@ test("AI notes require file and literal code evidence from actual differences", 
   assert.throws(() => validateNotes(valid, [{ file: "retry.js", diff: " context +const retries = 3;" }]), /无法核实/);
 });
 
+test("generated notes accept entries beyond the suggested count and length", () => {
+  const evidence = { note: "用户可见变化", file: "app.js", excerpt: "+const changed = true;" };
+  const patches = [{ file: evidence.file, diff: evidence.excerpt }];
+  const many = Array.from({ length: 12 }, (_, index) => ({ ...evidence, note: `变化${index}：${"详细说明".repeat(30)}` }));
+  const notes = many.map(item => `- ${item.note}`).join("\n");
+  const result = validateNotes({ notes, evidence: many }, patches);
+  assert.equal(result.notes_status, "generated");
+  assert.equal(result.notes, notes);
+  assert.deepEqual(result.evidence, many);
+});
+
 function largeNotePatches() {
   return Array.from({ length: 125 }, (_, index) => ({ file: `src/file-${index}.js`, diff: `@@ -1 +1,101 @@\n${Array.from({ length: 100 }, (_, line) => `+const value_${index}_${line} = ${line};\n`).join("")}` }));
 }
@@ -108,10 +119,60 @@ test("all large-diff batches are analyzed before validated notes are merged", as
     assert.ok(total > 1);
     seen.push(...batch);
     return batchNote(batch, `批次 ${index + 1} 的代码变更`);
+  }, async candidates => {
+    const evidence = candidates;
+    return { notes: evidence.map(item => `- ${item.note}`).join("\n"), evidence };
   });
   assert.equal(result.notes_status, "generated");
   assert.ok(result.evidence.length > 1);
+  assert.ok(result.evidence.length > 8);
   for (const patch of patches) assert.equal(seen.filter(item => item.file === patch.file).map(item => item.diff).join(""), patch.diff);
+});
+
+test("multi-batch results use one injected global selector with all candidates", async () => {
+  const patches = ["alpha", "beta"].map(name => ({ file: `${name}.js`, diff: `+const ${name} = '${"x".repeat(30_000)}';\n` }));
+  let candidates;
+  const result = await analyzeNotePatches(patches, build, async batch => {
+    const evidence = batch[0];
+    const excerpt = evidence.diff.trimEnd();
+    return { notes: `- 更新 ${evidence.file}`, evidence: [{ note: `更新 ${evidence.file}`, file: evidence.file, excerpt }] };
+  }, async selected => {
+    candidates = selected;
+    const candidate = selected.at(-1);
+    return { notes: `- ${candidate.note}`, evidence: [candidate] };
+  });
+  assert.equal(candidates.length, 2);
+  assert.equal(result.evidence[0].file, "beta.js");
+  assert.equal(result.notes, "- 更新 beta.js");
+});
+
+test("global AI selection retries invalid candidate references without accepting new text", async () => {
+  const candidates = [{ note: "增加启动提示", file: "app.js", excerpt: "+const startupHint = true;" }];
+  let calls = 0;
+  const result = await selectNoteCandidates(candidates, build, async (command, args) => {
+    calls += 1;
+    assert.equal(command, "copilot");
+    for (const flag of ["--available-tools", "--deny-tool", "--disable-builtin-mcps", "--no-custom-instructions", "--no-auto-update", "--no-ask-user"]) assert.ok(args.includes(flag));
+    if (calls === 1) return { stdout: JSON.stringify({ selected: ["c99"] }) };
+    assert.match(args[1], /上次精选结果未通过校验/);
+    return { stdout: JSON.stringify({ selected: ["c0"] }) };
+  });
+  assert.equal(calls, 2);
+  assert.deepEqual(result, { notes: "- 增加启动提示", evidence: candidates, notes_status: "generated" });
+});
+
+test("global AI selection preserves valid candidates beyond the suggested size without retrying", async () => {
+  const candidates = Array.from({ length: 9 }, (_, index) => ({
+    note: `变化${index}：${"必要说明".repeat(20)}`, file: "app.js", excerpt: "+const startupHint = true;",
+  }));
+  let calls = 0;
+  const result = await selectNoteCandidates(candidates, build, async () => {
+    calls += 1;
+    return { stdout: JSON.stringify({ selected: candidates.map((_, index) => `c${index}`) }) };
+  });
+  assert.equal(calls, 1);
+  assert.deepEqual(result.evidence, candidates);
+  assert.equal(result.notes, candidates.map(candidate => `- ${candidate.note}`).join("\n"));
 });
 
 test("batch evidence cannot cite changes from another batch", async () => {
@@ -156,7 +217,7 @@ test("quoted private key header fixtures pass without allowing actual or partial
 
 test("empty batch summaries are allowed but an entirely empty release requires manual notes", async () => {
   let calls = 0;
-  const result = await analyzeNotePatches(largeNotePatches(), build, async batch => ++calls === 1 ? batchNote(batch, "确认代码变更") : { notes: "", evidence: [] });
+  const result = await analyzeNotePatches(largeNotePatches(), build, async batch => ++calls === 1 ? batchNote(batch, "确认代码变更") : { notes: "", evidence: [] }, async evidence => ({ notes: evidence.map(item => `- ${item.note}`).join("\n"), evidence }));
   assert.equal(result.evidence.length, 1);
   await assert.rejects(analyzeNotePatches([{ file: "internal.js", diff: "+const internal = true;\n" }], build, async () => ({ notes: "", evidence: [] })), /缺少有效日志/);
 });
@@ -191,6 +252,22 @@ test("invalid AI references receive one correction with sanitized diagnostics", 
   assert.equal(calls, 2);
   assert.equal(result.notes_status, "generated");
 });
+
+for (const [name, notes] of [
+  ["longer entries", ["说明".repeat(60)]],
+  ["more entries", Array.from({ length: 9 }, (_, index) => `变更${index}`)],
+]) {
+  test(`AI accepts ${name} without a length correction retry`, async () => {
+    let calls = 0;
+    const result = await analyzeNoteBatch([{ file: "retry.js", diff: "+const retries = 3;\n" }], build, 0, 1, async (_command, args) => {
+      calls += 1;
+      const ref = args[1].match(/\[evidence:(b\d+p\d+l\d+)\]/)[1];
+      return { stdout: JSON.stringify({ entries: notes.map(note => ({ note, ref })) }) };
+    });
+    assert.equal(calls, 1);
+    assert.equal(result.notes, notes.map(note => `- ${note}`).join("\n"));
+  });
+}
 
 test("invalid JSON never appears in the correction prompt and repeated invalid references still fail", async () => {
   const patches = [{ file: "retry.js", diff: "+const retries = 3;\n" }];

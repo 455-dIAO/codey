@@ -107,11 +107,9 @@ export function resolveNoteEntries(value, references) {
   return { notes: evidence.map(item => `- ${item.note}`).join("\n"), evidence };
 }
 
-export function mergeNoteResults(results) {
+export function collectNoteCandidates(results) {
   if (!Array.isArray(results)) throw new TypeError("日志结果必须是数组");
-  const notes = [];
-  const evidence = [];
-  const seen = new Set();
+  const candidates = [];
   for (const result of results) {
     if (!result || typeof result.notes !== "string" || !Array.isArray(result.evidence)) throw new Error("分批日志结果无效");
     if (result.notes === "" && result.evidence.length === 0) continue;
@@ -119,12 +117,23 @@ export function mergeNoteResults(results) {
     if (lines.length !== result.evidence.length) throw new Error("分批日志与差异证据数量不一致");
     for (const [index, line] of lines.entries()) {
       if (!line.startsWith("- ") || typeof result.evidence[index]?.note !== "string" || result.evidence[index].note !== line.slice(2)) throw new Error("分批日志与差异证据不一致");
-      const note = result.evidence[index].note;
-      if (seen.has(note)) continue;
-      seen.add(note);
-      notes.push(`- ${note}`);
-      evidence.push(result.evidence[index]);
+      candidates.push(result.evidence[index]);
     }
+  }
+  return candidates;
+}
+
+export function mergeNoteResults(results) {
+  const candidates = collectNoteCandidates(results);
+  const notes = [];
+  const evidence = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const note = candidate.note;
+    if (seen.has(note)) continue;
+    seen.add(note);
+    notes.push(`- ${note}`);
+    evidence.push(candidate);
   }
   return { notes: notes.join("\n"), evidence };
 }
