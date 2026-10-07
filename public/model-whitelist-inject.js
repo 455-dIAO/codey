@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "61";
+  const patchVersion = "62";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -30,7 +30,7 @@
   const groupedMenuSelector = "[role='menu'], [role='listbox']";
   const groupedMenuItemSelector = "[role='menuitem'], [role='menuitemradio'], [role='option']";
   const subagentModelLabelSelector = "[class*='max-w-1/2']";
-  const modelPickerTriggerSelector = "button[aria-haspopup='menu'], button[aria-haspopup='listbox']";
+  const modelPickerTriggerSelector = "button[aria-haspopup='menu'], button[aria-haspopup='listbox'], [data-model-picker-view-toggle]";
   const modelQueryKey = ["models", "list"];
   const modelResponseEvent = "message";
   const modelRequestEvent = "codex-message-from-view";

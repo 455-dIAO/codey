@@ -693,7 +693,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "61");
+  assert.equal(patch.version, "62");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -4782,6 +4782,36 @@ const subagentCatalog = (prefix = "官1") => ({
     source_model: "gpt-6-luna",
   }],
 });
+
+for (const nativeSelectionOnly of [false, true]) {
+  test(`slider model row shows the route short name (native: ${nativeSelectionOnly})`, async () => {
+    const body = new FakeElementCore("body", { connected: true });
+    const runtime = await loadPatch({ ...subagentCatalog(), native_selection_only: nativeSelectionOnly }, [statsigClient()], { documentBody: body, nativeSelectionOnly });
+    const { trigger, textNode, effortNode, icon, picker } = composerModelTrigger(body, subagentRouteModel, { reactPicker: false });
+    trigger.tagName = "DIV";
+    trigger.removeAttribute("aria-haspopup");
+    trigger.setAttribute("role", "menuitem");
+    trigger.setAttribute("data-model-picker-view-toggle", "true");
+    let clicks = 0;
+    trigger.addEventListener("click", () => { clicks += 1; });
+    runtime.dispatchObserverMutations(body, [{ type: "childList", target: body, addedNodes: [trigger], removedNodes: [] }]);
+    assert.equal(textNode.nodeValue, "[官1] gpt-6-luna");
+    assert.equal(effortNode.nodeValue, "极高");
+    assert.equal(trigger.children[2], icon);
+    assert.equal(picker.model, subagentRouteModel);
+    trigger.dispatchEvent({ type: "click" });
+    assert.equal(clicks, 1);
+    textNode.nodeValue = "codey-official-account-deleted/gpt-6-sol";
+    runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: textNode }]);
+    assert.equal(textNode.nodeValue, "gpt-6-sol");
+    textNode.nodeValue = subagentRouteModel;
+    runtime.dispatchObserverMutations(trigger, [{ type: "characterData", target: textNode }]);
+    await runtime.patch.setCatalog({ ...subagentCatalog("主"), native_selection_only: nativeSelectionOnly });
+    assert.equal(textNode.nodeValue, "[主] gpt-6-luna");
+    runtime.patch.dispose();
+    assert.equal(textNode.nodeValue, subagentRouteModel);
+  });
+}
 
 function subagentHeader(body, text) {
   const toolbar = body.appendChild(new FakeElementCore("div"));
