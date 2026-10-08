@@ -4219,6 +4219,7 @@ mod tests {
         let template = json!({ "use_responses_lite": false });
 
         for model_id in [
+            "mimo-v2.5-pro",
             "provider/mimo-v2.5-pro",
             "provider/mimo-v2.6-pro",
             "provider/mimo-v2.6-flash",
