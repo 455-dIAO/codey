@@ -1962,6 +1962,23 @@ fn route_scoped_upstream_model_id(model_id: &str) -> &str {
         .unwrap_or(model_id)
 }
 
+fn third_party_model_requires_responses_lite(model_id: &str) -> bool {
+    // MiMo rejects Codex custom tools on these models unless the request uses
+    // its freeform Responses lite transport. Keep the list exact because
+    // mimo-v2.5 still uses the conservative full Responses transport.
+    const MIMO_RESPONSES_LITE_MODELS: [&str; 4] = [
+        "mimo-v2.5-pro",
+        "mimo-v2.6-pro",
+        "mimo-v2.6-flash",
+        "mimo-v2.6-pro-ultraspeed",
+    ];
+
+    let upstream_model_id = route_scoped_upstream_model_id(model_id);
+    MIMO_RESPONSES_LITE_MODELS
+        .iter()
+        .any(|candidate| model_id::equal(upstream_model_id, candidate))
+}
+
 fn official_entry_for_route_model<'a>(
     official_models: &'a [Value],
     route_model_id: &str,
@@ -2303,6 +2320,9 @@ fn synthetic_model(
     let mut model = template.clone();
     if !preserve_source_runtime_metadata {
         codey_runtime_core::model_suffix::sanitize_generic_model_metadata(&mut model);
+    }
+    if third_party_model_requires_responses_lite(model_id) {
+        model["use_responses_lite"] = json!(true);
     }
     if !preserve_source_runtime_metadata
         || model
@@ -4192,6 +4212,41 @@ mod tests {
             ["low", "medium", "high", "xhigh"]
         );
         assert!(custom["auto_compact_token_limit"].is_null());
+    }
+
+    #[test]
+    fn mimo_route_models_enable_responses_lite_only_when_required() {
+        let template = json!({ "use_responses_lite": false });
+
+        for model_id in [
+            "provider/mimo-v2.5-pro",
+            "provider/mimo-v2.6-pro",
+            "provider/mimo-v2.6-flash",
+            "provider/mimo-v2.6-pro-ultraspeed",
+            "provider/MiMo-V2.6-Pro",
+        ] {
+            let model = synthetic_model(&template, model_id, 0, false);
+            assert_eq!(
+                model["use_responses_lite"], true,
+                "{model_id} should use Responses lite"
+            );
+        }
+
+        for model_id in ["provider/mimo-v2.5", "provider/custom-model"] {
+            let model = synthetic_model(&template, model_id, 0, false);
+            assert_eq!(
+                model["use_responses_lite"], false,
+                "{model_id} should keep the conservative full Responses transport"
+            );
+        }
+
+        let official_mimo_v25_pro = synthetic_model(
+            &json!({ "use_responses_lite": false }),
+            "provider/mimo-v2.5-pro",
+            0,
+            true,
+        );
+        assert_eq!(official_mimo_v25_pro["use_responses_lite"], true);
     }
 
     #[test]
